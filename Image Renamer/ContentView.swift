@@ -9,139 +9,266 @@ import SwiftUI
 #if os(macOS)
 import AppKit
 #endif
+#if canImport(CoreML)
+import CoreML
+#endif
 
 struct ContentView: View {
     @StateObject private var viewModel = ImageRenamerViewModel()
 
     var body: some View {
-        NavigationSplitView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Image Renamer")
-                    .font(.largeTitle)
-                    .bold()
+        NavigationStack {
+            MainContent(viewModel: viewModel)
+                .task { await viewModel.refreshModels() }
+                .padding()
+        }
+    }
+}
 
-                HStack(spacing: 8) {
-                    Picker("Model", selection: $viewModel.selectedModel) {
-                        ForEach(viewModel.availableModels, id: \.self) { model in
-                            Text(model).tag(model)
-                        }
+// MARK: - Extracted main content
+private struct MainContent: View {
+    @ObservedObject var viewModel: ImageRenamerViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Image Renamer")
+                .font(.largeTitle)
+                .bold()
+
+            EnginePicker(engine: $viewModel.engine)
+
+            LanguagePicker(selectedLanguage: $viewModel.selectedLanguage)
+
+            ModelSelectionRow(viewModel: viewModel)
+
+            if viewModel.engine == .ollama {
+                ServerConnectionRow(viewModel: viewModel)
+            }
+
+            ActionButtons(viewModel: viewModel)
+
+            if viewModel.isProcessing {
+                ProcessingProgress(processed: viewModel.processedCount, total: viewModel.totalCount)
+            }
+
+            if let error = viewModel.errorMessage {
+                Text(error)
+                    .foregroundStyle(.red)
+            }
+
+            DebugLogSection(viewModel: viewModel)
+
+            CurrentItemDetail(viewModel: viewModel)
+        }
+    }
+}
+
+// MARK: - Engine Picker
+private struct EnginePicker: View {
+    @Binding var engine: AnalysisEngine
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Picker("Engine", selection: $engine) {
+                ForEach(AnalysisEngine.allCases) { engineCase in
+                    Text(engineCase.rawValue).tag(engineCase)
+                }
+            }
+            .pickerStyle(.segmented)
+        }
+    }
+}
+
+// MARK: - Language Picker
+private struct LanguagePicker: View {
+    @Binding var selectedLanguage: FilenameLanguage
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Picker("Language", selection: $selectedLanguage) {
+                ForEach(FilenameLanguage.allCases) { lang in
+                    Text(lang.rawValue).tag(lang)
+                }
+            }
+            .pickerStyle(.segmented)
+        }
+    }
+}
+
+// MARK: - Model Selection
+private struct ModelSelectionRow: View {
+    @ObservedObject var viewModel: ImageRenamerViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if viewModel.engine == .ollama {
+                Picker("Model", selection: $viewModel.selectedModel) {
+                    ForEach(viewModel.availableModels, id: \.self) { model in
+                        Text(model).tag(model)
                     }
-                    .pickerStyle(.menu)
+                }
+                .pickerStyle(.menu)
 
+                Button {
+                    Task { await viewModel.refreshModels() }
+                } label: {
+                    Label("Refresh Models", systemImage: "arrow.clockwise")
+                }
+                .disabled(viewModel.isProcessing)
+            } else {
+                HStack(spacing: 8) {
+                    Text(viewModel.coreMLModelDisplayName.isEmpty ? "No model selected" : viewModel.coreMLModelDisplayName)
+                        .lineLimit(1)
                     Button {
-                        Task { await viewModel.refreshModels() }
+                        viewModel.pickCoreMLModel()
                     } label: {
-                        Label("Refresh Models", systemImage: "arrow.clockwise")
+                        Label("Choose Core ML Model", systemImage: "doc.badge.plus")
                     }
                     .disabled(viewModel.isProcessing)
                 }
+            }
+        }
+    }
+}
 
-                HStack(spacing: 8) {
-                    Picker("Filename Language", selection: $viewModel.selectedLanguage) {
-                        ForEach(FilenameLanguage.allCases) { lang in
-                            Text(lang.rawValue).tag(lang)
+// MARK: - Server Connection (Ollama)
+private struct ServerConnectionRow: View {
+    @ObservedObject var viewModel: ImageRenamerViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            TextField("Server (IP or URL)", text: $viewModel.serverAddress)
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 280)
+                .disableAutocapitalization()
+                .disableAutocorrection(true)
+            Button {
+                Task { await viewModel.applyServerAddress() }
+            } label: {
+                Label("Connect", systemImage: "network")
+            }
+            .disabled(viewModel.isProcessing)
+        }
+    }
+}
+
+// MARK: - Action Buttons
+private struct ActionButtons: View {
+    @ObservedObject var viewModel: ImageRenamerViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button {
+                viewModel.pickImages()
+            } label: {
+                Label("Select Images", systemImage: "photo.on.rectangle")
+            }
+            .keyboardShortcut("o", modifiers: [.command])
+
+            Button {
+                viewModel.startAnalysis()
+            } label: {
+                Label("Analyze", systemImage: "sparkles")
+            }
+            .disabled(viewModel.selectedURLs.isEmpty || viewModel.isProcessing || (viewModel.engine == .coreml && !viewModel.isCoreMLReady))
+
+            Button {
+                viewModel.cancelAnalysis()
+            } label: {
+                Label("Stop", systemImage: "stop.circle")
+            }
+            .disabled(!viewModel.isProcessing)
+        }
+    }
+}
+
+// MARK: - Progress
+private struct ProcessingProgress: View {
+    let processed: Int
+    let total: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            let safeTotal: Double = Double(max(total, 1))
+            let progressValue: Double = Double(processed)
+            ProgressView(value: progressValue, total: safeTotal)
+            let percent: Int = Int((progressValue / safeTotal) * 100)
+            Text("\(percent)% • \(processed) / \(total)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Debug Log
+private struct DebugLogSection: View {
+    @ObservedObject var viewModel: ImageRenamerViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle("Show Translation Debug Log", isOn: $viewModel.showDebugLog)
+            if viewModel.showDebugLog {
+                TextEditor(text: $viewModel.debugLog)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(minHeight: 120, maxHeight: 200)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.2)))
+            }
+        }
+    }
+}
+
+// MARK: - Current Item Detail
+private struct CurrentItemDetail: View {
+    @ObservedObject var viewModel: ImageRenamerViewModel
+
+    var body: some View {
+        Group {
+            if let url = viewModel.currentURLBeingProcessed {
+                HStack(alignment: .top, spacing: 12) {
+#if os(macOS)
+                    Image(nsImage: NSImage(contentsOf: url) ?? NSImage(size: .zero))
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 160, height: 160)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.2)))
+#else
+                    Rectangle()
+                        .fill(Color.gray.opacity(0.2))
+                        .frame(width: 160, height: 160)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.2)))
+#endif
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(url.lastPathComponent)
+                            .font(.headline)
+                            .lineLimit(1)
+                        if let proposed = viewModel.results[url] {
+                            Text("→ \(proposed)\n")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        } else if let proposed = viewModel.allResults[url] {
+                            Text("→ \(proposed)\n")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        } else {
+                            Text("Analyzing…")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
                         }
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                HStack(spacing: 8) {
-                    TextField("Server (IP or URL)", text: $viewModel.serverAddress)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(minWidth: 280)
-                        .disableAutocapitalization()
-                        .disableAutocorrection(true)
-                    Button {
-                        Task { await viewModel.applyServerAddress() }
-                    } label: {
-                        Label("Connect", systemImage: "network")
-                    }
-                    .disabled(viewModel.isProcessing)
-                }
-
-                HStack(spacing: 8) {
-                    Button {
-                        viewModel.pickImages()
-                    } label: {
-                        Label("Select Images", systemImage: "photo.on.rectangle")
-                    }
-                    .keyboardShortcut("o", modifiers: [.command])
-
-                    Button {
-                        viewModel.startAnalysis()
-                    } label: {
-                        Label("Analyze", systemImage: "sparkles")
-                    }
-                    .disabled(viewModel.selectedURLs.isEmpty || viewModel.isProcessing)
-
-                    Button {
-                        viewModel.cancelAnalysis()
-                    } label: {
-                        Label("Stop", systemImage: "stop.circle")
-                    }
-                    .disabled(!viewModel.isProcessing)
-                }
-
-                if viewModel.isProcessing {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ProgressView(value: Double(viewModel.processedCount), total: Double(max(viewModel.totalCount, 1)))
-                        Text("\(Int((Double(viewModel.processedCount) / Double(max(viewModel.totalCount, 1))) * 100))% • \(viewModel.processedCount) / \(viewModel.totalCount)")
+                        Text(url.deletingLastPathComponent().path)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
+                    Spacer()
                 }
-
-                if let error = viewModel.errorMessage {
-                    Text(error)
-                        .foregroundStyle(.red)
-                }
-
-                List(selection: .constant(Set<URL>())) {
-                    ForEach(viewModel.selectedURLs, id: \.self) { url in
-                        HStack(alignment: .top, spacing: 12) {
-                            Image(nsImage: NSImage(contentsOf: url) ?? NSImage(size: .zero))
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(width: 64, height: 64)
-                                .cornerRadius(6)
-                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.gray.opacity(0.2)))
-
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(url.lastPathComponent)
-                                    .font(.headline)
-                                    .lineLimit(1)
-                                if let proposed = viewModel.results[url] {
-                                    Text("→ \(proposed)\n")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                        .textSelection(.enabled)
-                                } else {
-                                    Text("No proposal yet")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Text(url.deletingLastPathComponent().path)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                            Spacer()
-                        }
-                    }
-                }
-            }
-            .task { await viewModel.refreshModels() }
-            .padding()
-        } detail: {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("How it works")
-                    .font(.title2)
-                    .bold()
-                Text("1. Click ‘Select Images’ to choose local images.\n2. Enter your Ollama server’s IP (e.g., 192.168.1.10) and tap ‘Connect’, or use the default localhost.\n3. Click ‘Analyze’ to send each image to your Ollama server.\n4. Review the proposed names. If auto-rename is enabled, names are applied automatically.")
+            } else {
+                Text("No image currently being processed.")
                     .foregroundStyle(.secondary)
-                Spacer()
             }
-            .padding()
         }
     }
 }
