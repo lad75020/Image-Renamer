@@ -12,6 +12,9 @@ import AppKit
 #if canImport(CoreML)
 import CoreML
 #endif
+#if canImport(Translation)
+import Translation
+#endif
 
 struct ContentView: View {
     @StateObject private var viewModel = ImageRenamerViewModel()
@@ -29,6 +32,24 @@ struct ContentView: View {
 private struct MainContent: View {
     @ObservedObject var viewModel: ImageRenamerViewModel
 
+    #if canImport(Translation)
+    private var targetLanguage: Locale.Language? {
+        guard viewModel.translationMode == .apple else { return nil }
+        switch viewModel.selectedLanguage {
+        case .english:
+            return nil
+        case .french:
+            return Locale.Language(identifier: "fr")
+        case .german:
+            return Locale.Language(identifier: "de")
+        case .spanish:
+            return Locale.Language(identifier: "es")
+        }
+    }
+    #else
+    private var targetLanguage: Locale.Language? { nil }
+    #endif
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Image Renamer")
@@ -38,6 +59,8 @@ private struct MainContent: View {
             EnginePicker(engine: $viewModel.engine)
 
             LanguagePicker(selectedLanguage: $viewModel.selectedLanguage)
+
+            TranslationModePicker(translationMode: $viewModel.translationMode)
 
             ModelSelectionRow(viewModel: viewModel)
 
@@ -60,6 +83,26 @@ private struct MainContent: View {
 
             CurrentItemDetail(viewModel: viewModel)
         }
+        #if canImport(Translation)
+        .translationTask(source: Locale.Language(identifier: "en"), target: targetLanguage) { session in
+            if viewModel.translationMode == .apple {
+                viewModel.setAppleTranslator { text, _ in
+                    let response = try await session.translate(text)
+                    return response.targetText
+                }
+            } else {
+                viewModel.setAppleTranslator(nil)
+            }
+        }
+        .onChange(of: viewModel.translationMode) { _, newValue in
+            if newValue != .apple {
+                viewModel.setAppleTranslator(nil)
+            }
+        }
+        .onDisappear {
+            viewModel.setAppleTranslator(nil)
+        }
+        #endif
     }
 }
 
@@ -88,6 +131,30 @@ private struct LanguagePicker: View {
             Picker("Language", selection: $selectedLanguage) {
                 ForEach(FilenameLanguage.allCases) { lang in
                     Text(lang.rawValue).tag(lang)
+                }
+            }
+            .pickerStyle(.segmented)
+        }
+    }
+}
+
+// MARK: - Translation Mode Picker
+private struct TranslationModePicker: View {
+    @Binding var translationMode: TranslationMode
+
+    private var availableModes: [TranslationMode] {
+        #if canImport(Translation)
+        return TranslationMode.allCases
+        #else
+        return [.ai]
+        #endif
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Picker("Translation", selection: $translationMode) {
+                ForEach(availableModes) { mode in
+                    Text(mode.rawValue).tag(mode)
                 }
             }
             .pickerStyle(.segmented)
@@ -165,10 +232,14 @@ private struct ActionButtons: View {
             }
             .keyboardShortcut("o", modifiers: [.command])
 
+            Toggle("Force", isOn: $viewModel.forceRename)
+                .toggleStyle(.checkbox)
+                .disabled(viewModel.isProcessing)
+
             Button {
                 viewModel.startAnalysis()
             } label: {
-                Label("Analyze", systemImage: "sparkles")
+                Label("Rename", systemImage: "sparkles")
             }
             .disabled(viewModel.selectedURLs.isEmpty || viewModel.isProcessing || (viewModel.engine == .coreml && !viewModel.isCoreMLReady))
 

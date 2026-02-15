@@ -789,6 +789,12 @@ enum AnalysisEngine: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum TranslationMode: String, CaseIterable, Identifiable {
+    case ai = "AI"
+    case apple = "Apple"
+    var id: String { rawValue }
+}
+
 @MainActor
 final class ImageRenamerViewModel: ObservableObject {
     // Only allow common image file extensions to be analyzed
@@ -809,7 +815,8 @@ final class ImageRenamerViewModel: ObservableObject {
     }
 
     private func isAlreadyRenamed(_ url: URL, for engine: AnalysisEngine) -> Bool {
-        url.deletingPathExtension().lastPathComponent.contains(engineMarker(engine))
+        if forceRename { return false }
+        return url.deletingPathExtension().lastPathComponent.contains(engineMarker(engine))
     }
 
     private func convertHEICToJPEGIfNeeded(_ url: URL) throws -> URL {
@@ -863,6 +870,8 @@ final class ImageRenamerViewModel: ObservableObject {
     @Published var availableModels: [String] = []
     @Published var selectedModel: String = ""
     @Published var selectedLanguage: FilenameLanguage = .english
+    @Published var translationMode: TranslationMode = .ai
+    @Published var forceRename: Bool = false
     @Published var currentURLBeingProcessed: URL? = nil
     @Published var showDebugLog: Bool = false
     @Published var debugLog: String = ""
@@ -902,6 +911,7 @@ final class ImageRenamerViewModel: ObservableObject {
     #endif
 
     var client: OllamaClient
+    private var appleTranslator: ((String, FilenameLanguage) async throws -> String)?
 
     private static let debugDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -914,6 +924,10 @@ final class ImageRenamerViewModel: ObservableObject {
         debugLog.append("[\(stamp)] \(message)\n")
     }
 
+    func setAppleTranslator(_ translator: ((String, FilenameLanguage) async throws -> String)?) {
+        appleTranslator = translator
+    }
+
     init(client: OllamaClient? = nil) {
         if let client {
             self.client = client
@@ -922,11 +936,11 @@ final class ImageRenamerViewModel: ObservableObject {
             let saved = UserDefaults.standard.string(forKey: "OllamaServerAddress") ?? "127.0.0.1"
             if let url = ImageRenamerViewModel.normalizeServerAddress(saved) {
                 self.serverAddress = url.absoluteString
-                self.client = OllamaClient(baseURL: url, model: "llava-llama3:8b-v1.1-fp16")
+                self.client = OllamaClient(baseURL: url, model: "llava:13b")
             } else {
                 let fallback = URL(string: "http://127.0.0.1:11434")!
                 self.serverAddress = fallback.absoluteString
-                self.client = OllamaClient(baseURL: fallback, model: "llava-llama3:8b-v1.1-fp16")
+                self.client = OllamaClient(baseURL: fallback, model: "llava:13b")
             }
         }
         self.selectedModel = self.client.model
@@ -968,7 +982,7 @@ final class ImageRenamerViewModel: ObservableObject {
     }
 
     /// Starts the analysis in a cancellable Task so the UI can stop it.
-    func startAnalysis(prompt: String = "Provide a short, descriptive filename for this image without file extension.") {
+    func startAnalysis(prompt: String = "Provide a descriptive filename for this image without file extension in less than 10 words, separated with a dash.") {
         guard !isProcessing else { return }
         debugLog = ""
         analysisTask = Task { [weak self] in
@@ -1074,34 +1088,52 @@ final class ImageRenamerViewModel: ObservableObject {
     }
     #endif
 
-    private func maybeTranslate(_ text: String) -> String {
+    private func maybeTranslate(_ text: String) async -> String {
         if selectedLanguage == .english { return text }
-        #if canImport(CoreML)
-        guard var service = resolveTranslationService() else {
-            appendDebug("Translation skipped: no translation service")
+        switch translationMode {
+        case .ai:
+            #if canImport(CoreML)
+            guard var service = resolveTranslationService() else {
+                appendDebug("Translation skipped: no translation service")
+                return text
+            }
+            service.logger = { [weak self] message in
+                self?.appendDebug(message)
+            }
+            do {
+                appendDebug("Translation start language=\(selectedLanguage.rawValue)")
+                try service.load()
+                let out = try service.translate(text, to: selectedLanguage)
+                self.translationService = service // persist loaded tokenizer/models
+                appendDebug("Translation result=\(String(out.prefix(80)))")
+                return out
+            } catch {
+                self.errorMessage = "Translation failed: \(error.localizedDescription)"
+                appendDebug("Translation failed error=\(error.localizedDescription)")
+                return text
+            }
+            #else
             return text
+            #endif
+        case .apple:
+            guard let appleTranslator else {
+                appendDebug("Apple translation skipped: no session")
+                return text
+            }
+            do {
+                appendDebug("Apple translation start language=\(selectedLanguage.rawValue)")
+                let out = try await appleTranslator(text, selectedLanguage)
+                appendDebug("Apple translation result=\(String(out.prefix(80)))")
+                return out
+            } catch {
+                self.errorMessage = "Apple translation failed: \(error.localizedDescription)"
+                appendDebug("Apple translation failed error=\(error.localizedDescription)")
+                return text
+            }
         }
-        service.logger = { [weak self] message in
-            self?.appendDebug(message)
-        }
-        do {
-            appendDebug("Translation start language=\(selectedLanguage.rawValue)")
-            try service.load()
-            let out = try service.translate(text, to: selectedLanguage)
-            self.translationService = service // persist loaded tokenizer/models
-            appendDebug("Translation result=\(String(out.prefix(80)))")
-            return out
-        } catch {
-            self.errorMessage = "Translation failed: \(error.localizedDescription)"
-            appendDebug("Translation failed error=\(error.localizedDescription)")
-            return text
-        }
-        #else
-        return text
-        #endif
     }
 
-    func analyzeSelected(prompt: String = "Provide a short, descriptive filename for this image without file extension.") async {
+    func analyzeSelected(prompt: String = "Provide a descriptive filename for this image without file extension in less than 10 words separated with a dash.") async {
         guard !allCandidateURLs.isEmpty else { return }
 
         // Filter out unsupported or already renamed file types to avoid sending non-images or already renamed to the model
@@ -1168,7 +1200,7 @@ final class ImageRenamerViewModel: ObservableObject {
 
                     var output = raw
                     // If the prompt asked for a non-English language, many models may still reply in English. Attempt translation.
-                    output = maybeTranslate(output)
+                    output = await maybeTranslate(output)
                     let trimmed = String(output.prefix(120))
                     let sanitized = sanitizeFilename(trimmed)
                     let finalBase = String(sanitized.prefix(60))
@@ -1227,7 +1259,7 @@ final class ImageRenamerViewModel: ObservableObject {
 
                     // Use Core ML to describe the image
                     let raw = try describer.describe(imageURL: currentURL)
-                    let output = maybeTranslate(raw)
+                    let output = await maybeTranslate(raw)
                     let trimmed = String(output.prefix(120))
                     let sanitized = sanitizeFilename(trimmed)
                     let finalBase = String(sanitized.prefix(60))
