@@ -11,7 +11,7 @@ import AppKit
 
 /// A helper that loads a Core ML model and attempts to produce a short description for an image.
 /// It prefers Vision classification outputs, then falls back to model string outputs or top class label.
-final class CoreMLDescriber {
+nonisolated final class CoreMLDescriber {
     #if canImport(CoreML)
     private let model: MLModel
     #else
@@ -65,7 +65,7 @@ final class CoreMLDescriber {
 
 #if canImport(Vision)
 private extension CoreMLDescriber {
-    func classifyWithVision(cgImage: CGImage, vnModel: VNCoreMLModel) throws -> String? {
+    nonisolated func classifyWithVision(cgImage: CGImage, vnModel: VNCoreMLModel) throws -> String? {
         let request = VNCoreMLRequest(model: vnModel)
         request.imageCropAndScaleOption = .centerCrop
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
@@ -80,7 +80,7 @@ private extension CoreMLDescriber {
 
 #if canImport(CoreML)
 private extension CoreMLDescriber {
-    func predictDirectly(cgImage: CGImage) throws -> String {
+    nonisolated func predictDirectly(cgImage: CGImage) throws -> String {
         let desc = model.modelDescription
         // Find an image input key
         guard let imageInput = desc.inputDescriptionsByName.first(where: { $0.value.type == .image }) else {
@@ -117,7 +117,7 @@ private extension CoreMLDescriber {
         return "image"
     }
 
-    static func pixelBuffer(from cgImage: CGImage, size: CGSize, pixelFormat: OSType) -> CVPixelBuffer? {
+    nonisolated static func pixelBuffer(from cgImage: CGImage, size: CGSize, pixelFormat: OSType) -> CVPixelBuffer? {
         var px: CVPixelBuffer?
         let attrs: [CFString: Any] = [
             kCVPixelBufferCGImageCompatibilityKey: true,
@@ -150,7 +150,7 @@ private extension CoreMLDescriber {
 
 #if os(macOS)
 private extension NSImage {
-    func cgImage() -> CGImage? {
+    nonisolated func cgImage() -> CGImage? {
         var rect = CGRect(origin: .zero, size: self.size)
         return self.cgImage(forProposedRect: &rect, context: nil, hints: nil)
     }

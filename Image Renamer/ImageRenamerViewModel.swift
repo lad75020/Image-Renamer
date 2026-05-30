@@ -785,6 +785,7 @@ enum FilenameLanguage: String, CaseIterable, Identifiable {
 
 enum AnalysisEngine: String, CaseIterable, Identifiable {
     case ollama = "Ollama"
+    case openAICompatible = "OpenAI API"
     case coreml = "Core ML"
     var id: String { rawValue }
 }
@@ -795,6 +796,12 @@ enum TranslationMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private struct PreparedAnalysisImage: Sendable {
+    let originalURL: URL
+    let analysisURL: URL
+    let temporaryURL: URL?
+}
+
 @MainActor
 final class ImageRenamerViewModel: ObservableObject {
     // Only allow common image file extensions to be analyzed
@@ -803,51 +810,74 @@ final class ImageRenamerViewModel: ObservableObject {
     ]
 
     private func isSupportedImage(_ url: URL) -> Bool {
-        let ext = url.pathExtension.lowercased()
-        return allowedImageExtensions.contains(ext)
+        Self.isSupportedImageURL(url, allowedExtensions: allowedImageExtensions)
     }
 
-    private func engineMarker(_ engine: AnalysisEngine) -> String {
+    private nonisolated static func isSupportedImageURL(_ url: URL, allowedExtensions: Set<String>) -> Bool {
+        allowedExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    private nonisolated static func engineMarker(_ engine: AnalysisEngine) -> String {
         switch engine {
         case .ollama: return "__OLLAMA__"
+        case .openAICompatible: return "__OPENAI__"
         case .coreml: return "__COREML__"
         }
     }
 
+    private func engineMarker(_ engine: AnalysisEngine) -> String {
+        Self.engineMarker(engine)
+    }
+
     private func isAlreadyRenamed(_ url: URL, for engine: AnalysisEngine) -> Bool {
+        Self.isAlreadyRenamed(url, for: engine, forceRename: forceRename)
+    }
+
+    private nonisolated static func isAlreadyRenamed(_ url: URL, for engine: AnalysisEngine, forceRename: Bool) -> Bool {
         if forceRename { return false }
         return url.deletingPathExtension().lastPathComponent.contains(engineMarker(engine))
     }
 
-    private func convertHEICToJPEGIfNeeded(_ url: URL) throws -> URL {
-        #if os(macOS)
-        let ext = url.pathExtension.lowercased()
-        guard ext == "heic" || ext == "heif" else { return url }
+    private nonisolated static func prepareAnalysisImage(for url: URL) async throws -> PreparedAnalysisImage {
+        try await Task.detached(priority: .userInitiated) {
+            #if os(macOS)
+            let ext = url.pathExtension.lowercased()
+            guard ext == "heic" || ext == "heif" else {
+                return PreparedAnalysisImage(originalURL: url, analysisURL: url, temporaryURL: nil)
+            }
 
-        guard let image = NSImage(contentsOf: url),
-              let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.95]) else {
-            throw NSError(domain: "ImageRenamer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to convert HEIC to JPEG for \(url.lastPathComponent)"])
-        }
+            guard let image = NSImage(contentsOf: url),
+                  let tiff = image.tiffRepresentation,
+                  let bitmap = NSBitmapImageRep(data: tiff),
+                  let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.95]) else {
+                throw NSError(domain: "ImageRenamer", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to prepare HEIC preview for \(url.lastPathComponent)"])
+            }
 
-        let dir = url.deletingLastPathComponent()
-        let base = url.deletingPathExtension().lastPathComponent
-        let fm = FileManager.default
-        var candidate = dir.appendingPathComponent(base).appendingPathExtension("jpg")
-        var suffix = 1
-        while fm.fileExists(atPath: candidate.path) {
-            candidate = dir.appendingPathComponent("\(base)-\(suffix)").appendingPathExtension("jpg")
-            suffix += 1
-        }
+            let fm = FileManager.default
+            let tempDir = fm.temporaryDirectory.appendingPathComponent("ImageRenamer", isDirectory: true)
+            try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            let tempURL = tempDir
+                .appendingPathComponent(UUID().uuidString)
+                .appendingPathExtension("jpg")
+            try jpegData.write(to: tempURL, options: .atomic)
 
-        try jpegData.write(to: candidate, options: .atomic)
-        try fm.removeItem(at: url) // Delete original HEIC as requested
+            // Preserve the original HEIC/HEIF. The temporary JPEG is only used for model analysis.
+            return PreparedAnalysisImage(originalURL: url, analysisURL: tempURL, temporaryURL: tempURL)
+            #else
+            return PreparedAnalysisImage(originalURL: url, analysisURL: url, temporaryURL: nil)
+            #endif
+        }.value
+    }
 
-        return candidate
-        #else
-        return url
-        #endif
+    private nonisolated static func readImageData(from url: URL) async throws -> Data {
+        try await Task.detached(priority: .userInitiated) {
+            try Data(contentsOf: url)
+        }.value
+    }
+
+    private nonisolated static func cleanupTemporaryAnalysisFile(_ url: URL?) {
+        guard let url else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     // Batch processing configuration
@@ -868,7 +898,18 @@ final class ImageRenamerViewModel: ObservableObject {
     private var analysisTask: Task<Void, Never>? = nil
     private(set) var allResults: [URL: String] = [:]
     @Published var availableModels: [String] = []
-    @Published var selectedModel: String = ""
+    @Published var selectedModel: String = "" {
+        didSet {
+            switch engine {
+            case .ollama:
+                ollamaSelectedModel = selectedModel
+            case .openAICompatible:
+                openAISelectedModel = selectedModel
+            case .coreml:
+                break
+            }
+        }
+    }
     @Published var selectedLanguage: FilenameLanguage = .english
     @Published var translationMode: TranslationMode = .ai
     @Published var forceRename: Bool = false
@@ -876,7 +917,12 @@ final class ImageRenamerViewModel: ObservableObject {
     @Published var showDebugLog: Bool = false
     @Published var debugLog: String = ""
 
-    @Published var engine: AnalysisEngine = .ollama
+    @Published var engine: AnalysisEngine = .ollama {
+        didSet {
+            guard oldValue != engine else { return }
+            synchronizeRemoteConfigurationForSelectedEngine()
+        }
+    }
 
     // Core ML local model selection
     #if canImport(CoreML)
@@ -910,7 +956,14 @@ final class ImageRenamerViewModel: ObservableObject {
     var isCoreMLReady: Bool { false }
     #endif
 
+    private let defaultOllamaModel = "llava:13b"
+    private let defaultOpenAIModel = ""
+    private var ollamaServerAddress: String = "http://127.0.0.1:11434"
+    private var openAIServerAddress: String = "http://localhost:8887"
+    private var ollamaSelectedModel: String = ""
+    private var openAISelectedModel: String = ""
     var client: OllamaClient
+    var openAIClient: OpenAICompatibleClient
     private var appleTranslator: ((String, FilenameLanguage) async throws -> String)?
 
     private static let debugDateFormatter: DateFormatter = {
@@ -929,25 +982,32 @@ final class ImageRenamerViewModel: ObservableObject {
     }
 
     init(client: OllamaClient? = nil) {
+        let savedOllamaAddress = UserDefaults.standard.string(forKey: "OllamaServerAddress") ?? "127.0.0.1"
+        let ollamaFallbackURL = URL(string: "http://127.0.0.1:11434")!
+        let normalizedOllamaURL = ImageRenamerViewModel.normalizeServerAddress(savedOllamaAddress, defaultPort: 11434)
+        let ollamaURL = normalizedOllamaURL.flatMap { ImageRenamerViewModel.validateTransportPolicy(for: $0) == nil ? $0 : nil } ?? ollamaFallbackURL
+        self.ollamaServerAddress = ollamaURL.absoluteString
+
+        let savedOpenAIAddress = UserDefaults.standard.string(forKey: "OpenAICompatibleServerAddress") ?? "http://localhost:8887"
+        let openAIFallbackURL = URL(string: "http://localhost:8887")!
+        let normalizedOpenAIURL = ImageRenamerViewModel.normalizeServerAddress(savedOpenAIAddress, defaultPort: 8887)
+        let openAIURL = normalizedOpenAIURL.flatMap { ImageRenamerViewModel.validateTransportPolicy(for: $0) == nil ? $0 : nil } ?? openAIFallbackURL
+        self.openAIServerAddress = openAIURL.absoluteString
+
         if let client {
             self.client = client
-            self.serverAddress = client.baseURL.absoluteString
+            self.ollamaServerAddress = client.baseURL.absoluteString
         } else {
-            let saved = UserDefaults.standard.string(forKey: "OllamaServerAddress") ?? "127.0.0.1"
-            if let url = ImageRenamerViewModel.normalizeServerAddress(saved) {
-                self.serverAddress = url.absoluteString
-                self.client = OllamaClient(baseURL: url, model: "llava:13b")
-            } else {
-                let fallback = URL(string: "http://127.0.0.1:11434")!
-                self.serverAddress = fallback.absoluteString
-                self.client = OllamaClient(baseURL: fallback, model: "llava:13b")
-            }
+            self.client = OllamaClient(baseURL: ollamaURL, model: defaultOllamaModel)
         }
+        self.openAIClient = OpenAICompatibleClient(baseURL: openAIURL, model: defaultOpenAIModel)
+        self.ollamaSelectedModel = self.client.model
+        self.serverAddress = self.ollamaServerAddress
         self.selectedModel = self.client.model
         self.availableModels = [self.client.model]
     }
 
-    private static func normalizeServerAddress(_ input: String) -> URL? {
+    private static func normalizeServerAddress(_ input: String, defaultPort: Int) -> URL? {
         var string = input.trimmingCharacters(in: .whitespacesAndNewlines)
         if string.isEmpty { return nil }
         if !string.contains("://") {
@@ -955,29 +1015,99 @@ final class ImageRenamerViewModel: ObservableObject {
         }
         guard var comps = URLComponents(string: string) else { return nil }
         if comps.scheme == nil { comps.scheme = "http" }
-        if comps.port == nil { comps.port = 11434 }
+        if comps.port == nil { comps.port = defaultPort }
         return comps.url
+    }
+
+    private nonisolated static func validateTransportPolicy(for url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased() else {
+            return "Server address must include http or https."
+        }
+        guard scheme == "http" || scheme == "https" else {
+            return "Server address must use http or https."
+        }
+        if scheme == "https" { return nil }
+        guard let host = url.host(percentEncoded: false), isPlainHTTPAllowedHost(host) else {
+            return "HTTPS is required for WAN servers. Plain HTTP is allowed only for localhost, LAN, or Tailscale addresses."
+        }
+        return nil
+    }
+
+    private nonisolated static func isPlainHTTPAllowedHost(_ host: String) -> Bool {
+        let host = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+        if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") || host.hasSuffix(".ts.net") {
+            return true
+        }
+        if host == "::1" || host.hasPrefix("fe80:") || host.hasPrefix("fc") || host.hasPrefix("fd") {
+            return true
+        }
+        let parts = host.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4, parts.allSatisfy({ (0...255).contains($0) }) else { return false }
+        let first = parts[0]
+        let second = parts[1]
+        return first == 10 ||
+            first == 127 ||
+            (first == 172 && (16...31).contains(second)) ||
+            (first == 192 && second == 168) ||
+            (first == 169 && second == 254) ||
+            (first == 100 && (64...127).contains(second))
+    }
+
+    private func synchronizeRemoteConfigurationForSelectedEngine() {
+        switch engine {
+        case .ollama:
+            serverAddress = ollamaServerAddress
+            selectedModel = ollamaSelectedModel.isEmpty ? client.model : ollamaSelectedModel
+            availableModels = selectedModel.isEmpty ? [client.model] : [selectedModel]
+        case .openAICompatible:
+            serverAddress = openAIServerAddress
+            selectedModel = openAISelectedModel
+            availableModels = selectedModel.isEmpty ? [] : [selectedModel]
+        case .coreml:
+            availableModels = []
+        }
+        errorMessage = nil
     }
 
     /// Apply the current `serverAddress` by recreating the client and refreshing models.
     func applyServerAddress() async {
-        guard engine == .ollama else {
-            self.errorMessage = "Server address applies only to Ollama engine. Switch to Ollama to connect."
+        let defaultPort: Int
+        let invalidMessage: String
+        switch engine {
+        case .ollama:
+            defaultPort = 11434
+            invalidMessage = "Invalid server address. Enter an IP or URL like 192.168.1.10 or https://example.com:11434."
+        case .openAICompatible:
+            defaultPort = 8887
+            invalidMessage = "Invalid server address. Enter an IP or URL like 192.168.1.10 or https://example.com:8887."
+        case .coreml:
+            self.errorMessage = "Server address applies only to network engines."
             return
         }
-        guard let url = ImageRenamerViewModel.normalizeServerAddress(serverAddress) else {
-            self.errorMessage = "Invalid server address. Enter an IP or URL like 192.168.1.10 or http://192.168.1.10:11434."
+        guard let url = ImageRenamerViewModel.normalizeServerAddress(serverAddress, defaultPort: defaultPort) else {
+            self.errorMessage = invalidMessage
             return
         }
-        // Normalize and persist the canonical URL string
+        if let policyError = ImageRenamerViewModel.validateTransportPolicy(for: url) {
+            self.errorMessage = policyError
+            return
+        }
         self.serverAddress = url.absoluteString
-        UserDefaults.standard.set(self.serverAddress, forKey: "OllamaServerAddress")
-
-        // Rebuild the client pointing to the new server
-        let model = self.selectedModel.isEmpty ? "llava-llama3:8b-v1.1-fp16" : self.selectedModel
-        self.client = OllamaClient(baseURL: url, model: model)
-
-        // Refresh available models from the new server
+        self.errorMessage = nil
+        switch engine {
+        case .ollama:
+            self.ollamaServerAddress = url.absoluteString
+            UserDefaults.standard.set(self.serverAddress, forKey: "OllamaServerAddress")
+            let model = self.selectedModel.isEmpty ? defaultOllamaModel : self.selectedModel
+            self.client = OllamaClient(baseURL: url, model: model)
+        case .openAICompatible:
+            self.openAIServerAddress = url.absoluteString
+            UserDefaults.standard.set(self.serverAddress, forKey: "OpenAICompatibleServerAddress")
+            let model = self.selectedModel.isEmpty ? defaultOpenAIModel : self.selectedModel
+            self.openAIClient = OpenAICompatibleClient(baseURL: url, model: model)
+        case .coreml:
+            break
+        }
         await refreshModels()
     }
 
@@ -1003,49 +1133,85 @@ final class ImageRenamerViewModel: ObservableObject {
         panel.canChooseDirectories = true
         panel.allowedContentTypes = [UTType.image]
         if panel.runModal() == .OK {
-            var picked: [URL] = []
-            for url in panel.urls {
-                var isDir: ObjCBool = false
-                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
-                    // Recursively enumerate all subfolders and collect image files
-                    if let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.contentTypeKey], options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
-                        for case let file as URL in enumerator {
-                            if let type = try? file.resourceValues(forKeys: [.contentTypeKey]).contentType, type.conforms(to: .image), isSupportedImage(file) {
-                                if !isAlreadyRenamed(file, for: self.engine) {
-                                    picked.append(file)
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // If a single file was picked, ensure it's an allowed image type
-                    if isSupportedImage(url) && !isAlreadyRenamed(url, for: self.engine) {
-                        picked.append(url)
-                    }
-                }
+            let urls = panel.urls
+            let engine = self.engine
+            let forceRename = self.forceRename
+            let allowedImageExtensions = self.allowedImageExtensions
+            Task { [weak self] in
+                guard let self else { return }
+                let candidates = await Self.discoverCandidateImages(
+                    from: urls,
+                    engine: engine,
+                    forceRename: forceRename,
+                    allowedExtensions: allowedImageExtensions
+                )
+                self.allCandidateURLs = candidates
+                self.currentBatchIndex = 0
+                self.selectedURLs = Array(candidates.prefix(self.batchSize))
+                self.results.removeAll()
+                self.perFileErrors.removeAll()
+                self.processedCount = 0
+                self.totalCount = self.selectedURLs.count
+                self.errorMessage = candidates.isEmpty ? "No supported images found." : nil
             }
-            // Build candidate list (allowed images, not already renamed)
-            let candidates = picked.filter { isSupportedImage($0) && !isAlreadyRenamed($0, for: self.engine) }
-            self.allCandidateURLs = candidates
-            self.currentBatchIndex = 0
-            self.selectedURLs = Array(candidates.prefix(batchSize))
         }
         #else
         self.errorMessage = "Image picking is only implemented for macOS in this sample."
         #endif
     }
 
+    private nonisolated static func discoverCandidateImages(
+        from urls: [URL],
+        engine: AnalysisEngine,
+        forceRename: Bool,
+        allowedExtensions: Set<String>
+    ) async -> [URL] {
+        await Task.detached(priority: .userInitiated) {
+            var picked: [URL] = []
+            let fm = FileManager.default
+            for url in urls {
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                    if let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: [.contentTypeKey], options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
+                        while let file = enumerator.nextObject() as? URL {
+                            if Self.isSupportedImageURL(file, allowedExtensions: allowedExtensions),
+                               !Self.isAlreadyRenamed(file, for: engine, forceRename: forceRename) {
+                                picked.append(file)
+                            }
+                        }
+                    }
+                } else if Self.isSupportedImageURL(url, allowedExtensions: allowedExtensions),
+                          !Self.isAlreadyRenamed(url, for: engine, forceRename: forceRename) {
+                    picked.append(url)
+                }
+            }
+            return picked
+        }.value
+    }
+
     func refreshModels() async {
-        guard engine == .ollama else {
+        guard engine != .coreml else {
             self.availableModels = []
             return
         }
         do {
-            let models = try await client.listModels()
+            let models: [String]
+            switch engine {
+            case .ollama:
+                models = try await client.listModels()
+            case .openAICompatible:
+                models = try await openAIClient.listModels()
+            case .coreml:
+                models = []
+            }
             self.availableModels = models.sorted()
             if !self.availableModels.contains(self.selectedModel), let first = self.availableModels.first {
                 self.selectedModel = first
             }
+            if self.availableModels.isEmpty {
+                self.selectedModel = ""
+            }
+            self.errorMessage = nil
         } catch {
             self.errorMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         }
@@ -1058,7 +1224,7 @@ final class ImageRenamerViewModel: ObservableObject {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        panel.allowedFileTypes = ["mlmodel", "mlmodelc"]
+        panel.allowedContentTypes = [.data]
         panel.prompt = "Choose Model"
         if panel.runModal() == .OK, let url = panel.url {
             do {
@@ -1085,6 +1251,12 @@ final class ImageRenamerViewModel: ObservableObject {
         #else
         throw NSError(domain: "ImageRenamer", code: -100, userInfo: [NSLocalizedDescriptionKey: "Core ML is not available on this platform."])
         #endif
+    }
+
+    private nonisolated static func describeImage(with describer: CoreMLDescriber, imageURL: URL) async throws -> String {
+        try await Task.detached(priority: .userInitiated) {
+            try describer.describe(imageURL: imageURL)
+        }.value
     }
     #endif
 
@@ -1134,25 +1306,26 @@ final class ImageRenamerViewModel: ObservableObject {
     }
 
     func analyzeSelected(prompt: String = "Provide a descriptive filename for this image without file extension in less than 10 words separated with a dash.") async {
-        guard !allCandidateURLs.isEmpty else { return }
+        let batchURLs = selectedURLs
+        guard !batchURLs.isEmpty else { return }
 
-        // Filter out unsupported or already renamed file types to avoid sending non-images or already renamed to the model
-        let (supported, unsupported) = allCandidateURLs.partitioned { isSupportedImage($0) && !isAlreadyRenamed($0, for: self.engine) }
-        if !unsupported.isEmpty {
-            for url in unsupported {
-                perFileErrors[url] = "Unsupported file type or already renamed: .\(url.pathExtension.lowercased())"
-            }
-        }
-        guard !supported.isEmpty else { return }
+        // Process only the visible/current batch. Recursive folder discovery remains in allCandidateURLs for later batches.
+        let (supported, unsupported) = batchURLs.partitioned { isSupportedImage($0) && !isAlreadyRenamed($0, for: self.engine) }
         processedCount = 0
         totalCount = supported.count
-        if Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
-
         isProcessing = true
         errorMessage = nil
         results.removeAll()
-        allResults.removeAll()
         perFileErrors.removeAll()
+        for url in unsupported {
+            perFileErrors[url] = "Unsupported file type or already renamed: .\(url.pathExtension.lowercased())"
+        }
+        guard !supported.isEmpty else {
+            isProcessing = false
+            analysisTask = nil
+            return
+        }
+        if Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
 
         switch engine {
         case .ollama:
@@ -1171,17 +1344,15 @@ final class ImageRenamerViewModel: ObservableObject {
                 if Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
                 var currentURL = url
                 do {
-                    currentURL = try convertHEICToJPEGIfNeeded(url)
-                    if currentURL != url {
-                        if let idx = self.selectedURLs.firstIndex(of: url) { self.selectedURLs[idx] = currentURL }
-                        if let idxAll = self.allCandidateURLs.firstIndex(of: url) { self.allCandidateURLs[idxAll] = currentURL }
-                    }
+                    let prepared = try await Self.prepareAnalysisImage(for: url)
+                    defer { Self.cleanupTemporaryAnalysisFile(prepared.temporaryURL) }
+                    currentURL = prepared.originalURL
                     if isAlreadyRenamed(currentURL, for: self.engine) { self.processedCount += 1; continue }
 
                     // Update UI to show the current image being processed
                     self.currentURLBeingProcessed = currentURL
 
-                    let data = try Data(contentsOf: currentURL)
+                    let data = try await Self.readImageData(from: prepared.analysisURL)
                     let promptWithLanguage = prompt + " Respond in \(self.selectedLanguage.rawValue)."
 
                     func requestOnce() async throws -> String {
@@ -1208,8 +1379,69 @@ final class ImageRenamerViewModel: ObservableObject {
                     if Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
 
                     if autoRenameEnabled {
-                        let (newURL, markedBase) = try renameOne(originalURL: currentURL, base: finalBase, engine: self.engine)
+                        let (newURL, markedBase) = try await Self.renameFile(originalURL: currentURL, base: finalBase, engine: self.engine)
                         // Update the current processing URL to the renamed file
+                        self.currentURLBeingProcessed = newURL
+                        if let idxAll = self.allCandidateURLs.firstIndex(of: currentURL) { self.allCandidateURLs[idxAll] = newURL }
+                        if let idxSel = self.selectedURLs.firstIndex(of: currentURL) { self.selectedURLs[idxSel] = newURL }
+                        if self.selectedURLs.contains(newURL) {
+                            self.results.removeValue(forKey: currentURL)
+                            self.results[newURL] = markedBase
+                        }
+                        self.allResults.removeValue(forKey: currentURL)
+                        self.allResults[newURL] = markedBase
+                    } else {
+                        self.allResults[currentURL] = finalBase
+                        if self.selectedURLs.contains(currentURL) { self.results[currentURL] = finalBase }
+                    }
+                    self.processedCount += 1
+                    try? await Task.sleep(nanoseconds: perRequestDelayNanoseconds)
+                } catch {
+                    if error is CancellationError || Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
+                    let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    self.perFileErrors[currentURL] = message
+                    self.errorMessage = message
+                    self.processedCount += 1
+                    try? await Task.sleep(nanoseconds: perRequestDelayNanoseconds)
+                    continue
+                }
+            }
+        case .openAICompatible:
+            do {
+                try await openAIClient.healthCheck()
+                if Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
+            } catch {
+                self.errorMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                self.isProcessing = false
+                return
+            }
+
+            for url in supported {
+                if isAlreadyRenamed(url, for: self.engine) { self.processedCount += 1; continue }
+                if Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
+                var currentURL = url
+                do {
+                    let prepared = try await Self.prepareAnalysisImage(for: url)
+                    defer { Self.cleanupTemporaryAnalysisFile(prepared.temporaryURL) }
+                    currentURL = prepared.originalURL
+                    if isAlreadyRenamed(currentURL, for: self.engine) { self.processedCount += 1; continue }
+
+                    self.currentURLBeingProcessed = currentURL
+
+                    let data = try await Self.readImageData(from: prepared.analysisURL)
+                    let promptWithLanguage = prompt + " Respond in \(self.selectedLanguage.rawValue)."
+                    let raw = try await openAIClient.describeImage(data: data, imageURL: prepared.analysisURL, prompt: promptWithLanguage, model: selectedModel)
+
+                    var output = raw
+                    output = await maybeTranslate(output)
+                    let trimmed = String(output.prefix(120))
+                    let sanitized = sanitizeFilename(trimmed)
+                    let finalBase = String(sanitized.prefix(60))
+
+                    if Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
+
+                    if autoRenameEnabled {
+                        let (newURL, markedBase) = try await Self.renameFile(originalURL: currentURL, base: finalBase, engine: self.engine)
                         self.currentURLBeingProcessed = newURL
                         if let idxAll = self.allCandidateURLs.firstIndex(of: currentURL) { self.allCandidateURLs[idxAll] = newURL }
                         if let idxSel = self.selectedURLs.firstIndex(of: currentURL) { self.selectedURLs[idxSel] = newURL }
@@ -1247,18 +1479,16 @@ final class ImageRenamerViewModel: ObservableObject {
                 if Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
                 var currentURL = url
                 do {
-                    currentURL = try convertHEICToJPEGIfNeeded(url)
-                    if currentURL != url {
-                        if let idx = self.selectedURLs.firstIndex(of: url) { self.selectedURLs[idx] = currentURL }
-                        if let idxAll = self.allCandidateURLs.firstIndex(of: url) { self.allCandidateURLs[idxAll] = currentURL }
-                    }
+                    let prepared = try await Self.prepareAnalysisImage(for: url)
+                    defer { Self.cleanupTemporaryAnalysisFile(prepared.temporaryURL) }
+                    currentURL = prepared.originalURL
                     if isAlreadyRenamed(currentURL, for: self.engine) { self.processedCount += 1; continue }
 
                     // Update UI to show the current image being processed
                     self.currentURLBeingProcessed = currentURL
 
-                    // Use Core ML to describe the image
-                    let raw = try describer.describe(imageURL: currentURL)
+                    // Use Core ML to describe the image off the main actor.
+                    let raw = try await Self.describeImage(with: describer, imageURL: prepared.analysisURL)
                     let output = await maybeTranslate(raw)
                     let trimmed = String(output.prefix(120))
                     let sanitized = sanitizeFilename(trimmed)
@@ -1267,7 +1497,7 @@ final class ImageRenamerViewModel: ObservableObject {
                     if Task.isCancelled { self.isProcessing = false; self.analysisTask = nil; return }
 
                     if autoRenameEnabled {
-                        let (newURL, markedBase) = try renameOne(originalURL: currentURL, base: finalBase, engine: self.engine)
+                        let (newURL, markedBase) = try await Self.renameFile(originalURL: currentURL, base: finalBase, engine: self.engine)
                         // Update the current processing URL to the renamed file
                         self.currentURLBeingProcessed = newURL
                         if let idxAll = self.allCandidateURLs.firstIndex(of: currentURL) { self.allCandidateURLs[idxAll] = newURL }
@@ -1304,34 +1534,13 @@ final class ImageRenamerViewModel: ObservableObject {
         analysisTask = nil
     }
 
-    private func renameOne(originalURL: URL, base: String, engine: AnalysisEngine) throws -> (URL, String) {
-        let fm = FileManager.default
-        let ext = originalURL.pathExtension.isEmpty ? "" : "." + originalURL.pathExtension.lowercased()
-        let marker = engineMarker(engine)
-        let markedBase = base.contains(marker) ? base : "\(base)\(marker)"
-        let dir = originalURL.deletingLastPathComponent()
-        var candidate = dir.appendingPathComponent(markedBase + ext)
-
-        var suffix = 1
-        while fm.fileExists(atPath: candidate.path) {
-            candidate = dir.appendingPathComponent("\(markedBase)-\(suffix)" + ext)
-            suffix += 1
-        }
-
-        try fm.moveItem(at: originalURL, to: candidate)
-        return (candidate, markedBase)
-    }
-
-    func renameFiles() {
-        guard !results.isEmpty else { return }
-        let fm = FileManager.default
-        var updated: [URL: String] = [:]
-
-        for (url, base) in results {
-            let ext = url.pathExtension.isEmpty ? "" : "." + url.pathExtension.lowercased()
-            let marker = engineMarker(self.engine)
+    private nonisolated static func renameFile(originalURL: URL, base: String, engine: AnalysisEngine) async throws -> (URL, String) {
+        try await Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            let ext = originalURL.pathExtension.isEmpty ? "" : "." + originalURL.pathExtension.lowercased()
+            let marker = engineMarker(engine)
             let markedBase = base.contains(marker) ? base : "\(base)\(marker)"
-            let dir = url.deletingLastPathComponent()
+            let dir = originalURL.deletingLastPathComponent()
             var candidate = dir.appendingPathComponent(markedBase + ext)
 
             var suffix = 1
@@ -1340,25 +1549,37 @@ final class ImageRenamerViewModel: ObservableObject {
                 suffix += 1
             }
 
-            do {
-                try fm.moveItem(at: url, to: candidate)
-                updated[candidate] = markedBase
-                // Keep global results in sync with renamed files
-                self.allResults.removeValue(forKey: url)
-                self.allResults[candidate] = markedBase
-            } catch {
-                errorMessage = "Failed to rename \(url.lastPathComponent): \(error.localizedDescription)"
-                updated[url] = markedBase
-                self.allResults[url] = markedBase
+            try fm.moveItem(at: originalURL, to: candidate)
+            return (candidate, markedBase)
+        }.value
+    }
+
+    func renameFiles() {
+        guard !results.isEmpty else { return }
+        let pending = results
+        let engine = self.engine
+        Task { [weak self] in
+            guard let self else { return }
+            var updated: [URL: String] = [:]
+            for (url, base) in pending {
+                do {
+                    let (candidate, markedBase) = try await Self.renameFile(originalURL: url, base: base, engine: engine)
+                    updated[candidate] = markedBase
+                    self.allResults.removeValue(forKey: url)
+                    self.allResults[candidate] = markedBase
+                } catch {
+                    let marker = Self.engineMarker(engine)
+                    let markedBase = base.contains(marker) ? base : "\(base)\(marker)"
+                    self.errorMessage = "Failed to rename \(url.lastPathComponent): \(error.localizedDescription)"
+                    updated[url] = markedBase
+                    self.allResults[url] = markedBase
+                }
             }
+
+            self.selectedURLs = Array(updated.keys)
+            self.results = updated
+            self.loadNextBatchIfAvailable()
         }
-
-        // Update selected URLs to reflect new locations
-        self.selectedURLs = Array(updated.keys)
-        self.results = updated
-
-        // After finishing this batch, try to load the next batch if available
-        loadNextBatchIfAvailable()
     }
 
     func loadNextBatchIfAvailable() {
@@ -1454,4 +1675,3 @@ private extension Array {
         return (first, second)
     }
 }
-
