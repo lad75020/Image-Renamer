@@ -880,11 +880,9 @@ final class ImageRenamerViewModel: ObservableObject {
         try? FileManager.default.removeItem(at: url)
     }
 
-    // Batch processing configuration
-    private let batchSize: Int = 20
+    // Selection processing configuration
     private let perRequestDelayNanoseconds: UInt64 = 300_000_000 // 300ms
-    private(set) var allCandidateURLs: [URL] = [] // all eligible images discovered (not yet processed)
-    @Published var currentBatchIndex: Int = 0 // zero-based batch index
+    private(set) var allCandidateURLs: [URL] = [] // all eligible images discovered from the picker
 
     @Published var selectedURLs: [URL] = []
     @Published var results: [URL: String] = [:] // proposed base name (no extension)
@@ -1146,8 +1144,7 @@ final class ImageRenamerViewModel: ObservableObject {
                     allowedExtensions: allowedImageExtensions
                 )
                 self.allCandidateURLs = candidates
-                self.currentBatchIndex = 0
-                self.selectedURLs = Array(candidates.prefix(self.batchSize))
+                self.selectedURLs = candidates
                 self.results.removeAll()
                 self.perFileErrors.removeAll()
                 self.processedCount = 0
@@ -1306,11 +1303,11 @@ final class ImageRenamerViewModel: ObservableObject {
     }
 
     func analyzeSelected(prompt: String = "Provide a descriptive filename for this image without file extension in less than 10 words separated with a dash.") async {
-        let batchURLs = selectedURLs
-        guard !batchURLs.isEmpty else { return }
+        let selectedForRun = selectedURLs
+        guard !selectedForRun.isEmpty else { return }
 
-        // Process only the visible/current batch. Recursive folder discovery remains in allCandidateURLs for later batches.
-        let (supported, unsupported) = batchURLs.partitioned { isSupportedImage($0) && !isAlreadyRenamed($0, for: self.engine) }
+        // Process every selected candidate. Large selections are surfaced in the UI, but are not capped.
+        let (supported, unsupported) = selectedForRun.partitioned { isSupportedImage($0) && !isAlreadyRenamed($0, for: self.engine) }
         processedCount = 0
         totalCount = supported.count
         isProcessing = true
@@ -1578,24 +1575,8 @@ final class ImageRenamerViewModel: ObservableObject {
 
             self.selectedURLs = Array(updated.keys)
             self.results = updated
-            self.loadNextBatchIfAvailable()
-        }
-    }
 
-    func loadNextBatchIfAvailable() {
-        let start = (currentBatchIndex + 1) * batchSize
-        guard start < allCandidateURLs.count else { return }
-        currentBatchIndex += 1
-        let end = min(start + batchSize, allCandidateURLs.count)
-        self.selectedURLs = Array(allCandidateURLs[start..<end])
-        self.results.removeAll()
-        for url in self.selectedURLs {
-            if let name = allResults[url] {
-                self.results[url] = name
-            }
         }
-        self.perFileErrors.removeAll()
-        self.errorMessage = nil
     }
 }
 

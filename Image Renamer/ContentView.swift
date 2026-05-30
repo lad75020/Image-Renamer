@@ -574,6 +574,9 @@ private struct SidebarFooter: View {
             return "\(viewModel.processedCount)/\(viewModel.totalCount) renamed — press to run remaining"
         }
         if viewModel.processedCount > 0 { return "\(viewModel.processedCount)/\(viewModel.totalCount) renamed" }
+        if viewModel.selectedURLs.count > 20 {
+            return "Ready to process all \(viewModel.selectedURLs.count) images — use Stop anytime"
+        }
         return "Runs locally — nothing leaves your Mac"
     }
 
@@ -751,7 +754,7 @@ private struct FocusPanel: View {
     private var badgeText: String {
         switch state {
         case .processing: return viewModel.isProcessing ? "Analyzing…" : "Analyzing…"
-        case .done:       return "Batch complete"
+        case .done:       return "Selection complete"
         case .recent:     return "Last renamed"
         case .idle:       return "Preview"
         }
